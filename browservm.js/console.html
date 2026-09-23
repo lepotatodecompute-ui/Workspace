@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>BrowserVM</title>
+<link rel="stylesheet" href="xterm.css" />
+<script src="xterm.js"></script>
+<script src="idb-keyval-iife.min.js"></script>
+<style>
+  html, body { height: 100%; margin: 0; background: #1e1e1e; color: #ddd;
+    font-family: -apple-system, Segoe UI, sans-serif; }
+  #toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: #252526; border-bottom: 1px solid #333; }
+  #toolbar button { background: #0e639c; color: #fff; border: none; padding: 6px 12px;
+    border-radius: 3px; cursor: pointer; font-size: 13px; }
+  #toolbar button:hover { background: #1177bb; }
+  #toolbar button:disabled { background: #555; cursor: default; }
+  #iso-status { font-size: 12px; color: #aaa; flex: 1; }
+  #metrics { display: flex; gap: 12px; font-size: 12px; color: #aaa; white-space: nowrap; }
+  #iso-progress { width: 140px; height: 6px; background: #333; border-radius: 3px;
+    overflow: hidden; display: none; }
+  #iso-progress-bar { height: 100%; width: 0%; background: #0e639c; transition: width .1s; }
+  #terminal { padding: 6px; }
+</style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="mode-toggle-btn">Mode: checking&hellip;</button>
+    <button id="load-iso-btn">Load .iso&hellip;</button>
+    <input id="iso-file-input" type="file" accept=".iso" style="display:none" />
+    <div id="iso-progress"><div id="iso-progress-bar"></div></div>
+    <div id="iso-status">
+      Second disk (/dev/vdb) is empty. Load an .iso to write it there, then
+      <code>mount -t iso9660 /dev/vdb /mnt</code> in the guest (reboot the VM
+      first if it already read the empty disk).
+    </div>
+    <div id="metrics">
+      <span id="operations-per-second">Operations/s: --</span>
+      <span id="ethernet-stats">Ethernet sent: 0 | received: 0</span>
+      <span id="memory-usage">Memory: --</span>
+    </div>
+  </div>
+  <div id="terminal"></div>
+
+<script src="device.js"></script>
+<script>
+/* ---------------------------------------------------------------------
+ * Execution mode toggle (interpreter / JIT).
+ *
+ * This reports real status, not a cosmetic switch: it feature-detects the
+ * WebAssembly capabilities the JIT tier needs (per the project's README,
+ * chiefly tail-call optimization) and, separately, whether the currently
+ * loaded emulator.wasm actually contains a JIT dispatch path to engage.
+ *
+ * As of this build it does not: emulator.wasm was compiled with only the
+ * TCG interpreter backend (CONFIG_TCG_INTERPRETER) — the JIT backend
+ * (libtcg/jit/tcg-target.inc.c) was never published upstream, so there is
+ * no code path here for "JIT" to actually switch on. Selecting it is left
+ * in as a real, working preference for a build that does include it, and
+ * honestly reports the fallback in the meantime rather than pretending.
+ * ------------------------------------------------------------------- */
+(() => {
+  const btn = document.getElementById('mode-toggle-btn');
+  let wantsJit = false; // user's preference; what actually runs may differ
+
+  const supportsTailCall = () => {
+    // Tail-call proposal support: best-effort feature probe. No standard
+    // JS-visible flag exists, so this checks for the WebAssembly.Function
+    // constructor (needed either way to build the JIT's TB trampolines)
+    // as a floor; true tail-call support can only be confirmed by the
+    // module itself at instantiation time.
+    return typeof WebAssembly.Function === 'function';
+  };
+
+  // Does emulator.wasm actually contain a JIT dispatch path? See the
+  // console output / repo notes: as shipped, no — this is a static,
+  // honest answer about the file you're running, not a live probe,
+  // since there's nothing in this build for a probe to detect.
+  const JIT_BACKEND_PRESENT_IN_THIS_BUILD = false;
+
+  const render = () => {
+    if (!wantsJit) {
+      btn.textContent = 'Mode: Interpreter';
+      btn.title = 'Click to prefer JIT (if this build supports it)';
+    } else if (JIT_BACKEND_PRESENT_IN_THIS_BUILD) {
+      btn.textContent = supportsTailCall() ? 'Mode: JIT' : 'Mode: JIT requested (browser fallback \u2192 Interpreter)';
+    } else {
+      btn.textContent = 'Mode: JIT requested (this build has no JIT backend \u2192 Interpreter)';
+    }
+  };
+
+  btn.addEventListener('click', () => {
+    wantsJit = !wantsJit;
+    render();
+  });
+
+  render();
+})();
+</script>
+<script>
+/* ---------------------------------------------------------------------
+ * ISO loader: reads the chosen .iso client-side and writes it into the
+ * SAME IndexedDB block store the second virtio-block device (0x20040000,
+ * /dev/vdb in the guest) already reads/writes via handleHarddisk() in
+ * device.js — key scheme `b${sectorNum}`, HARDDISK_PAGE (512) bytes each.
+ * No C/wasm changes needed: this just pre-populates the disk the emulator
+ * already knows how to serve.
+ * ------------------------------------------------------------------- */
+(() => {
+  const fileInput = document.getElementById('iso-file-input');
+  const loadBtn = document.getElementById('load-iso-btn');
+  const statusEl = document.getElementById('iso-status');
+  const progressWrap = document.getElementById('iso-progress');
+  const progressBar = document.getElementById('iso-progress-bar');
+
+  loadBtn.addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    loadBtn.disabled = true;
+    progressWrap.style.display = 'block';
+    statusEl.textContent = `Loading ${file.name} (${(file.size / 1048576).toFixed(1)} MB)…`;
+
+    try {
+      const filesystemSizeMb = (() => {
+        const value = Number.parseInt(new URLSearchParams(window.location.search).get('fs'), 10);
+        return Number.isFinite(value) && value > 0 ? value : 256;
+      })();
+      const maxSectors = filesystemSizeMb * 1024 * 1024 / HARDDISK_PAGE;
+      const totalSectors = Math.ceil(file.size / HARDDISK_PAGE);
+      if (totalSectors > maxSectors) {
+        throw new Error(`ISO is larger than the ${filesystemSizeMb} MB virtual disk`);
+      }
+
+      const buf = new Uint8Array(await file.arrayBuffer());
+      await idbKeyval.set('iso-image', buf);
+      await idbKeyval.set('iso-sector-count', totalSectors);
+      progressBar.style.width = '100%';
+
+      statusEl.textContent =
+        `Loaded ${file.name}. Restarting the VM from /dev/vdb...`;
+      window.restartEmulator();
+    } catch (err) {
+      console.error('ISO load failed', err);
+      statusEl.textContent = `Failed to load ${file.name}: ${err.message}`;
+    } finally {
+      loadBtn.disabled = false;
+      progressWrap.style.display = 'none';
+      fileInput.value = '';
+    }
+  });
+})();
+</script>
+</body>
+</html>

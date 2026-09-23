@@ -1,0 +1,129 @@
+diff --git a/device.js b/device.js
+index 400f58c..8d910bc 100644
+--- a/device.js
++++ b/device.js
+@@ -133,6 +133,106 @@ const handleHarddisk = async () => {
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------------
++ * Ethernet: WebSocket relay transport.
++ *
++ * The guest's virtio-net device and the worker<->main-thread SharedArrayBuffer
++ * pipe (ethernet_output_sab / ethernet_input_sab) are already wired up by
++ * main.c / library.js. This relay is the piece that was missing: it forwards
++ * raw Ethernet frames the guest sends to a WebSocket relay server, and
++ * injects frames the relay sends back into ethernet_input_sab so the guest's
++ * virtio-net driver picks them up via lib_ethernet_input.
++ *
++ * Protocol: one binary WebSocket message == one raw Ethernet frame, in each
++ * direction. No extra framing. This matches the relay protocol used by other
++ * browser-VM projects (e.g. v86's network relay), so a v86-compatible relay
++ * (self-hosted or public) should work here without changes. The relay server
++ * itself runs a user-mode NAT/SLIRP stack and is NOT part of this repo.
++ * ------------------------------------------------------------------- */
++const ETHERNET_RELAY_URL =
++	(typeof window !== 'undefined' && window.BROWSERVM_RELAY_URL) ||
++	'ws://localhost:8080/';
++const ETHERNET_MAX_QUEUED_FRAMES = 32;
++
++let ethernetSocket = null;
++let ethernetSocketReady = false;
++let ethernetSendQueue = [];
++let ethernetReconnectTimer = null;
++
++const connectEthernetRelay = () => {
++	if (ethernetReconnectTimer) {
++		clearTimeout(ethernetReconnectTimer);
++		ethernetReconnectTimer = null;
++	}
++	let socket;
++	try {
++		socket = new WebSocket(ETHERNET_RELAY_URL);
++		socket.binaryType = 'arraybuffer';
++	} catch (e) {
++		console.error('Ethernet relay: failed to open socket', e);
++		ethernetReconnectTimer = setTimeout(connectEthernetRelay, 3000);
++		return;
++	}
++	ethernetSocket = socket;
++
++	socket.onopen = () => {
++		if (socket !== ethernetSocket) return;
++		ethernetSocketReady = true;
++		console.log('Ethernet relay connected: ' + ETHERNET_RELAY_URL);
++		for (const frame of ethernetSendQueue) {
++			socket.send(frame);
++		}
++		ethernetSendQueue = [];
++	};
++
++	socket.onmessage = (ev) => {
++		if (socket !== ethernetSocket) return;
++		const frame = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : null;
++		if (frame) deliverEthernetFrame(frame);
++	};
++
++	socket.onclose = () => {
++		if (socket !== ethernetSocket) return;
++		ethernetSocketReady = false;
++		ethernetSocket = null;
++		ethernetReconnectTimer = setTimeout(connectEthernetRelay, 3000);
++	};
++
++	socket.onerror = (e) => {
++		console.error('Ethernet relay error', e);
++	};
++};
++
++/* Called from handleEthernet() below with a frame the guest sent out. */
++const sendEthernetFrame = (frame) => {
++	if (ethernetSocketReady && ethernetSocket) {
++		ethernetSocket.send(frame);
++	} else if (ethernetSendQueue.length < ETHERNET_MAX_QUEUED_FRAMES) {
++		/* Queue a bounded burst (e.g. the guest's first DHCP discover) while
++		 * the relay socket is (re)connecting, instead of silently dropping it. */
++		ethernetSendQueue.push(frame);
++	}
++};
++
++/* Called from the relay's onmessage with a frame to hand to the guest.
++ * Writes it into ethernet_input_sab for lib_ethernet_input (worker side)
++ * to pick up. If the guest hasn't drained the previous inbound frame yet,
++ * or the SAB lock is held by the worker right now, the frame is dropped —
++ * TCP retransmits, and this keeps the hardware-poll loop from blocking. */
++const deliverEthernetFrame = (frame) => {
++	if (!ethernet_input_sab_mutex) return;
++	if (ethernet_input_sab_mutex.try_lock()) {
++		const ethernet_sab_i32a = new Int32Array(ethernet_input_sab);
++		const ethernet_sab_u8a = new Uint8Array(ethernet_input_sab);
++		const capacity = ethernet_input_sab.byteLength - 8;
++		if (ethernet_sab_i32a[1] === 0 && frame.length <= capacity) {
++			ethernet_sab_u8a.set(frame, 8);
++			ethernet_sab_i32a[1] = frame.length;
++		}
++		ethernet_input_sab_mutex.unlock();
++	}
++};
++
+ const handleEthernet = async () => {
+ 	if (ethernet_output_sab_mutex.try_lock()) {
+ 		const ethernet_sab_i32a = new Int32Array(ethernet_output_sab);
+@@ -141,7 +241,7 @@ const handleEthernet = async () => {
+ 		if (ulen > 0) {
+ 			const ustr = ethernet_sab_u8a.slice(8, 8 + ulen);
+ 			ethernet_sab_i32a[1] = 0;
+-			console.error('Sliently dropped, network not implemented yet');
++			sendEthernetFrame(ustr);
+ 		}
+ 		ethernet_output_sab_mutex.unlock();
+ 	}
+@@ -197,4 +297,5 @@ const writeConsole = (key) => {
+ }
+ 
+ /* Kick out the event loop */
+-setTimeout(handleHardwareReq, 1000);
+\ No newline at end of file
++setTimeout(handleHardwareReq, 1000);
++connectEthernetRelay();
+\ No newline at end of file
